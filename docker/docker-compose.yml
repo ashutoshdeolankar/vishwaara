@@ -11,6 +11,12 @@ services:
       - DATABASE_URL=postgresql://travelpal:travelpal@db:5432/travelpal
       - RECAPTCHA_SITE_KEY=${RECAPTCHA_SITE_KEY:-}
       - RECAPTCHA_SECRET_KEY=${RECAPTCHA_SECRET_KEY:-}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      - SMTP_FROM=${SMTP_FROM:-}
+      - SMTP_HOST=${SMTP_HOST:-smtp.gmail.com}
+      - SMTP_PORT=${SMTP_PORT:-465}
+      - EMAIL_CODES=${EMAIL_CODES:-}
     volumes:
       - ../src:/app/src
       - ../data:/app/data

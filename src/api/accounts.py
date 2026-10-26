@@ -7,8 +7,10 @@ of that token is stored, and it expires after 7 days.
 
 Endpoints (the token is sent as "Authorization: Bearer <token>"):
     GET    /auth/captcha      which human check to show (Google reCAPTCHA or a maths question)
-    POST   /auth/register     create an account and log in
-    POST   /auth/login        log in
+    POST   /auth/register     create an account (and log in, or email a 6-digit code)
+    POST   /auth/login        log in (or check the password and email a 6-digit code)
+    POST   /auth/verify       send the emailed code, get the login token
+    POST   /auth/resend       email a new code
     POST   /auth/logout       log out
     GET    /auth/me           who am I
     PUT    /auth/me           change name / home city
@@ -27,8 +29,10 @@ import logging
 import os
 import re
 import secrets
+import smtplib
 import threading
 import time
+from email.message import EmailMessage
 from typing import Annotated, Any
 
 import httpx
@@ -65,6 +69,9 @@ RECAPTCHA_VERIFY_URL = "https://www.google.com/recaptcha/api/siteverify"
 MAX_PLAN_BYTES = 200_000
 MAX_TRIPS_PER_USER = 200
 MAX_FAVOURITES_PER_USER = 500
+CODE_LIFETIME_SECONDS = 10 * 60
+CODE_RESEND_SECONDS = 30
+CODE_MAX_TRIES = 5
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 # ── Tables ─────────────────────────────────────────────────────────
@@ -115,6 +122,17 @@ favourites = Table(
     Column("avg_rating", Float),
     Column("created_at", DateTime(timezone=True), server_default=func.now()),
     UniqueConstraint("user_id", "place_name", "city", name="uq_favourite_place"),
+)
+
+# one pending email code per address: only a hash of the code is stored
+login_codes = Table(
+    "login_codes",
+    metadata,
+    Column("email", String(254), primary_key=True),
+    Column("code_hash", String(64), nullable=False),
+    Column("expires_at", Integer, nullable=False),
+    Column("tries", Integer, nullable=False, default=0),
+    Column("sent_at", Integer, nullable=False),
 )
 
 _tables_ready = False
@@ -268,6 +286,119 @@ def verify_human(token: str, answer: str) -> None:
         verify_captcha(token, answer)
 
 
+# ── Email code (one-time password) ─────────────────────────────────
+# When the SMTP settings are present (SMTP_USER + SMTP_PASSWORD, for example a
+# Gmail address with an "app password"), sign up and login also need a 6-digit
+# code that was emailed to the user. With EMAIL_CODES=log the code is printed in
+# the API log instead (for testing). With neither, there is no code step.
+def email_codes_mode() -> str:
+    """"smtp", "log" or "off"."""
+    if os.environ.get("SMTP_USER", "").strip() and os.environ.get("SMTP_PASSWORD", "").strip():
+        return "smtp"
+    if os.environ.get("EMAIL_CODES", "").strip().lower() == "log":
+        return "log"
+    return "off"
+
+
+def send_email(to_address: str, subject: str, body: str) -> None:
+    """Send a plain-text email through the SMTP account from the environment."""
+    user = os.environ["SMTP_USER"].strip()
+    password = os.environ["SMTP_PASSWORD"].replace(" ", "")  # Google shows it in groups of 4
+    host = os.environ.get("SMTP_HOST", "smtp.gmail.com").strip()
+    port = int(os.environ.get("SMTP_PORT", "465"))
+    sender = os.environ.get("SMTP_FROM", "").strip() or user
+
+    message = EmailMessage()
+    message["From"] = f"Vishwaara <{sender}>"
+    message["To"] = to_address
+    message["Subject"] = subject
+    message.set_content(body)
+
+    if port == 465:
+        server = smtplib.SMTP_SSL(host, port, timeout=15)
+    else:
+        server = smtplib.SMTP(host, port, timeout=15)
+        server.starttls()
+    with server:
+        server.login(user, password)
+        server.send_message(message)
+
+
+def _code_hash(email: str, code: str) -> str:
+    return hash_token(f"{email}:{code}")
+
+
+def send_login_code(email: str, name: str) -> None:
+    """Make a fresh 6-digit code for this email address and send it."""
+    now = int(time.time())
+    code = f"{secrets.randbelow(1_000_000):06d}"
+
+    with engine.begin() as conn:
+        old = conn.execute(select(login_codes).where(login_codes.c.email == email)).first()
+        if old is not None and now - old.sent_at < CODE_RESEND_SECONDS:
+            raise HTTPException(
+                status_code=429,
+                detail="A code was just sent. Please wait half a minute before asking again.",
+            )
+        conn.execute(delete(login_codes).where(login_codes.c.email == email))
+        conn.execute(
+            insert(login_codes).values(
+                email=email,
+                code_hash=_code_hash(email, code),
+                expires_at=now + CODE_LIFETIME_SECONDS,
+                tries=0,
+                sent_at=now,
+            )
+        )
+
+    if email_codes_mode() == "log":
+        logger.warning("Verification code for %s is %s (EMAIL_CODES=log)", email, code)
+        return
+
+    try:
+        send_email(
+            email,
+            "Your Vishwaara verification code",
+            f"Hi {name},\n\nYour Vishwaara verification code is {code}.\n"
+            f"It works for 10 minutes. If you did not ask for it, you can ignore this email.\n",
+        )
+    except (smtplib.SMTPException, OSError) as error:
+        logger.error("Could not send the verification email: %s", error)
+        raise HTTPException(
+            status_code=503,
+            detail="Could not send the verification email. Please try again in a moment.",
+        ) from error
+
+
+def check_login_code(email: str, code: str) -> None:
+    """Raise a 400 error unless this is the right, fresh, unused code for the email."""
+    wrong = HTTPException(status_code=400, detail="Wrong code. Please check the email and try again.")
+    now = int(time.time())
+
+    with engine.begin() as conn:
+        row = conn.execute(select(login_codes).where(login_codes.c.email == email)).first()
+        if row is None:
+            raise HTTPException(
+                status_code=400, detail="No code is waiting for this email. Log in again."
+            )
+        if row.expires_at < now:
+            conn.execute(delete(login_codes).where(login_codes.c.email == email))
+            raise HTTPException(status_code=400, detail="The code expired. Log in again to get a new one.")
+        if row.tries >= CODE_MAX_TRIES:
+            conn.execute(delete(login_codes).where(login_codes.c.email == email))
+            raise HTTPException(status_code=400, detail="Too many wrong tries. Log in again to get a new code.")
+
+        if hmac.compare_digest(row.code_hash, _code_hash(email, code.strip())):
+            conn.execute(delete(login_codes).where(login_codes.c.email == email))  # works only once
+            return
+
+        conn.execute(
+            update(login_codes).where(login_codes.c.email == email).values(tries=row.tries + 1)
+        )
+    # raised after the block so the extra "try" is saved, not rolled back
+    raise wrong
+
+
 def _start_session(conn: Any, user_id: int) -> str:
     token = secrets.token_urlsafe(32)
     conn.execute(
@@ -320,6 +451,15 @@ class LoginRequest(BaseModel):
     password: str = Field(..., max_length=128)
     captcha_token: str = Field(default="", max_length=4096)
     captcha_answer: str = Field(default="", max_length=20)
+
+
+class VerifyRequest(BaseModel):
+    email: str = Field(..., max_length=254)
+    code: str = Field(..., min_length=1, max_length=12)
+
+
+class ResendRequest(BaseModel):
+    email: str = Field(..., max_length=254)
 
 
 class ProfileUpdate(BaseModel):
@@ -423,10 +563,16 @@ def register(body: RegisterRequest) -> dict:
             ) from error
 
         user_id = result.inserted_primary_key[0]
-        token = _start_session(conn, user_id)
+        if email_codes_mode() == "off":
+            token = _start_session(conn, user_id)
+        else:
+            token = None
         row = conn.execute(select(users).where(users.c.id == user_id)).one()
 
     logger.info("New account created (user id %s)", user_id)
+    if token is None:
+        send_login_code(row.email, row.name)
+        return {"needs_code": True, "email": row.email}
     return {"token": token, "user": _user_dict(row)}
 
 
@@ -443,9 +589,40 @@ def login(body: LoginRequest) -> dict:
         if row is None or not check_password(body.password, row.password_hash):
             raise HTTPException(status_code=401, detail="Wrong email or password.")
 
+        token = _start_session(conn, row.id) if email_codes_mode() == "off" else None
+
+    if token is None:
+        send_login_code(row.email, row.name)
+        return {"needs_code": True, "email": row.email}
+    return {"token": token, "user": _user_dict(row)}
+
+
+@router.post("/auth/verify")
+def verify(body: VerifyRequest) -> dict:
+    ensure_tables()
+    email = body.email.strip().lower()
+    check_login_code(email, body.code)
+
+    with engine.begin() as conn:
+        row = conn.execute(select(users).where(users.c.email == email)).first()
+        if row is None:
+            raise HTTPException(status_code=400, detail="No account for this email.")
         token = _start_session(conn, row.id)
 
     return {"token": token, "user": _user_dict(row)}
+
+
+@router.post("/auth/resend")
+def resend(body: ResendRequest) -> dict:
+    """Email a new code, but only to an address that already has a code waiting."""
+    ensure_tables()
+    email = body.email.strip().lower()
+    with engine.connect() as conn:
+        waiting = conn.execute(select(login_codes.c.email).where(login_codes.c.email == email)).first()
+        row = conn.execute(select(users).where(users.c.email == email)).first()
+    if waiting is not None and row is not None:
+        send_login_code(row.email, row.name)
+    return {"ok": True}
 
 
 @router.post("/auth/logout")

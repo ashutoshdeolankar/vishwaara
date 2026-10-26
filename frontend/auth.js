@@ -115,6 +115,9 @@ const TravelPalAuth = (function () {
             captcha_token: captcha ? captcha.token : "",
             captcha_answer: captcha ? captcha.answer : ""
         });
+        if (data.needs_code) {
+            return { needsCode: true, email: data.email };
+        }
         write({ token: data.token, user: data.user });
         return data.user;
     }
@@ -126,8 +129,22 @@ const TravelPalAuth = (function () {
             captcha_token: captcha ? captcha.token : "",
             captcha_answer: captcha ? captcha.answer : ""
         });
+        if (data.needs_code) {
+            return { needsCode: true, email: data.email };
+        }
         write({ token: data.token, user: data.user });
         return data.user;
+    }
+
+    /* the 6-digit code that was emailed after sign up / password check */
+    async function verifyCode(email, code) {
+        const data = await request("POST", "/auth/verify", { email: email, code: code });
+        write({ token: data.token, user: data.user });
+        return data.user;
+    }
+
+    function resendCode(email) {
+        return request("POST", "/auth/resend", { email: email });
     }
 
     async function logout() {
@@ -218,6 +235,8 @@ const TravelPalAuth = (function () {
     return {
         request: request,
         getCaptcha: getCaptcha,
+        verifyCode: verifyCode,
+        resendCode: resendCode,
         register: register,
         login: login,
         logout: logout,

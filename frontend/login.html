@@ -145,6 +145,16 @@
     </form>
 
     <!-- SIGN UP -->
+    <form id="codeForm" novalidate style="display: none;">
+        <p class="hint" id="codeInfo">We emailed a 6-digit code to you.</p>
+        <div class="mb-4">
+            <label class="form-label" for="codeInput">6-digit code</label>
+            <input class="form-control" type="text" inputmode="numeric" id="codeInput" maxlength="6" autocomplete="one-time-code" placeholder="123456" required>
+            <a href="#" class="hint" id="resendCode">Send the code again</a>
+        </div>
+        <button class="btn-main" type="submit" id="codeButton">Verify and continue</button>
+    </form>
+
     <form id="signupForm" novalidate style="display: none;">
         <div class="mb-3">
             <label class="form-label" for="signupName">Your name</label>
@@ -278,6 +288,7 @@ document.querySelectorAll(".refresh-captcha").forEach(link => {
 
 function showTab(name) {
     const login = name === "login";
+    document.getElementById("codeForm").style.display = "none";
     document.getElementById("loginForm").style.display = login ? "block" : "none";
     document.getElementById("signupForm").style.display = login ? "none" : "block";
     document.getElementById("tabLogin").classList.toggle("active", login);
@@ -285,6 +296,50 @@ function showTab(name) {
     messageBox.className = "";
     loadCaptcha(login ? "login" : "signup");
 }
+
+let pendingEmail = "";
+
+function showCodeForm(email) {
+    pendingEmail = email;
+    ["loginForm", "signupForm"].forEach(id => {
+        document.getElementById(id).style.display = "none";
+    });
+    document.getElementById("codeForm").style.display = "block";
+    document.getElementById("codeInfo").textContent =
+        "We emailed a 6-digit code to " + email + ". It works for 10 minutes. Check Spam too.";
+    document.getElementById("codeInput").value = "";
+    document.getElementById("codeInput").focus();
+    showMessage("Code sent. Please check your email.", "ok");
+}
+
+document.getElementById("codeForm").addEventListener("submit", async event => {
+    event.preventDefault();
+    const button = document.getElementById("codeButton");
+    const code = document.getElementById("codeInput").value.trim();
+    if (!/^\d{6}$/.test(code)) {
+        showMessage("Type the 6 digits from the email.", "error");
+        return;
+    }
+    button.disabled = true;
+    try {
+        await TravelPalAuth.verifyCode(pendingEmail, code);
+        showMessage("Done! Taking you back...", "ok");
+        window.location.href = nextPage;
+    } catch (error) {
+        showMessage(error.message, "error");
+        button.disabled = false;
+    }
+});
+
+document.getElementById("resendCode").addEventListener("click", async event => {
+    event.preventDefault();
+    try {
+        await TravelPalAuth.resendCode(pendingEmail);
+        showMessage("If the last code is older than 30 seconds, a new one was sent.", "ok");
+    } catch (error) {
+        showMessage(error.message, "error");
+    }
+});
 
 document.getElementById("tabLogin").addEventListener("click", () => showTab("login"));
 document.getElementById("tabSignup").addEventListener("click", () => showTab("signup"));
@@ -296,7 +351,13 @@ async function submitForm(event, form, button, action) {
     const label = button.textContent;
     button.textContent = "Please wait...";
     try {
-        await action();
+        const result = await action();
+        if (result && result.needsCode) {
+            button.disabled = false;
+            button.textContent = label;
+            showCodeForm(result.email);
+            return;
+        }
         showMessage("Done! Taking you back...", "ok");
         window.location.href = nextPage;
     } catch (error) {

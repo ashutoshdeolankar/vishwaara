@@ -25,6 +25,10 @@ def _fresh_state(monkeypatch):
     # real reCAPTCHA keys (if set on this computer) must not change these tests
     monkeypatch.delenv("RECAPTCHA_SITE_KEY", raising=False)
     monkeypatch.delenv("RECAPTCHA_SECRET_KEY", raising=False)
+    # the emailed-code step must not change these tests either
+    monkeypatch.delenv("SMTP_USER", raising=False)
+    monkeypatch.delenv("SMTP_PASSWORD", raising=False)
+    monkeypatch.delenv("EMAIL_CODES", raising=False)
     api_main._rate_tracker.clear()
     accounts.ensure_tables()
     yield
